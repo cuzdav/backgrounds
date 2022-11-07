@@ -1,8 +1,11 @@
 #include "olcPixelGameEngine.h"
 #include <cassert>
 #include <optional>
+#include <ostream>
 #include <random>
 #include <stack>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include <iostream>
@@ -14,14 +17,23 @@ std::mt19937 rg_ = std::mt19937{std::random_device{}()};
 class Maze : public olc::PixelGameEngine {
   public:
     bool OnUserCreate() override {
-        maze_.resize(width_ * height_);
-        buildEnter(0);
+        init();
         return true;
     }
 
-    bool OnUserUpdate(float fElapsedTime) override {
+    void init() {
+        filterColorPct_ = 0;
+        maze_.clear();
+        path_.clear();
+        state_ = State::Building;
+        maze_.resize(width_ * height_);
+        path_.reserve(width_ * height_);
+        buildEnter(0);
+    }
 
-        // exit?
+    bool OnUserUpdate(float fElapsedTime) override {
+        elapsed_ += fElapsedTime;
+
         if (GetKey(olc::Key::SPACE).bPressed) {
             return false;
         }
@@ -47,6 +59,37 @@ class Maze : public olc::PixelGameEngine {
         SolveVisited = 1 << 6, // never unset, has solver been here
         SolvePath    = 1 << 7  // cell is on current solution path
     };
+
+    static std::string toString(State s) {
+        using enum State;
+        switch (s) {
+            case Building: return "Building";
+            case Solving: return "Solving";
+            case Solved: return "Solved";
+            default: return "?State?";
+        }
+    }
+
+    static std::string toString(Flags f) {
+        using enum Flags;
+        switch (f) {
+            case Empty: return "Empty";
+            case North: return "North";
+            case East: return "East";
+            case South: return "South";
+            case West: return "West";
+            case BuildVisited: return "BuildVisited"; // never unset, has builder seen this cell
+            case SolveVisited: return "SolveVisited"; // never unset, has solver seen this cell
+            case SolvePath: return "SolvePath"; // set only when this cell is part of current path
+            default: return "?Flags?";
+        }
+    }
+
+    template <typename EnumT>
+    friend std::ostream &operator<<(std::ostream &os, EnumT e) requires(std::is_enum_v<EnumT>) {
+        return os << toString(e);
+    }
+
     friend int operator+(Flags val) { return static_cast<int>(val); }
     friend Flags operator|=(Flags &lhs, Flags rhs) { return lhs = Flags{+lhs | +rhs}; }
     friend Flags operator&(Flags lhs, Flags rhs) { return Flags{+lhs & +rhs}; }
@@ -61,9 +104,17 @@ class Maze : public olc::PixelGameEngine {
         }
     }
 
-    void solved() {}
+    void solved() {
+        if (elapsed_ > 0.05f) {
+            filterColorPct_ += 20;
+            elapsed_ = 0;
+        }
+        if (filterColorPct_ >= 255) {
+            init();
+        }
+    }
 
-    bool isFlagSet(Flags flags, Flags flag) const { return (flags & flag) != Flags::Empty; }
+    static bool isFlagSet(Flags flags, Flags flag) { return (flags & flag) != Flags::Empty; }
 
     void draw() {
         Clear(olc::BLACK);
@@ -73,7 +124,7 @@ class Maze : public olc::PixelGameEngine {
 
         for (int idx = 0; idx < maze_.size(); ++idx) {
             if (visited(idx)) {
-                auto color  = solveVisited(idx) ? olc::RED : olc::BLUE;
+                auto color  = inCurrentSolvePath(idx) ? olc::RED : olc::BLUE;
                 auto [x, y] = idx2xy(idx);
                 FillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight, color);
                 Flags flags = maze_[idx];
@@ -96,82 +147,87 @@ class Maze : public olc::PixelGameEngine {
                 }
             }
         }
+
+        if (filterColorPct_ > 0) {
+            auto color = olc::BLACK;
+            color.a    = static_cast<std::uint8_t>(filterColorPct_);
+            SetPixelMode(olc::Pixel::Mode::ALPHA);
+            FillRect(0, 0, ScreenWidth(), ScreenHeight(), color);
+            SetPixelMode(olc::Pixel::Mode::NORMAL);
+        }
     }
 
     void solveMaze() {
-        assert(not path_.empty());
-        int curIdx = path_.top();
-        if (curIdx == height_ * width_ - 1) {
-            state_ = State::Solved;
-            return;
-        }
-        int nextIdx = -1;
-        for (Flags dir : {Flags::North, Flags::East, Flags::South, Flags::West}) {
-            if (not isFlagSet(maze_[curIdx], dir)) {
-                auto idx = indexOffset(curIdx, dir);
-                if (idx.has_value() && not solveVisited(*idx)) {
-                    nextIdx = *idx;
-                    break;
+        do {
+            assert(not path_.empty());
+            int curIdx = path_.back();
+            if (curIdx == height_ * width_ - 1) {
+                state_ = State::Solved;
+                return;
+            }
+            int nextIdx = -1;
+            for (Flags dir : {Flags::South, Flags::East, Flags::North, Flags::West}) {
+                if (isFlagSet(maze_[curIdx], dir)) {
+                    auto idx = indexOffset(curIdx, dir);
+                    if (idx.has_value() && not solveVisited(*idx)) {
+                        nextIdx = *idx;
+                        break;
+                    }
                 }
             }
-        }
-        if (nextIdx == -1) {
-            removeFromPath(curIdx);
-        } else {
-            solveEnter(nextIdx);
-        }
+            if (nextIdx == -1) {
+                removeFromPath(curIdx);
+            } else {
+                solveEnter(nextIdx);
+            }
+        } while (fastsolve_ && state_ == State::Solving);
     }
 
     void buildMaze() {
-        int neighbors[4];
-        Flags direction[4];
-        int neighborCount = 0;
-        assert(not path_.empty());
-        while (true) {
-            int curIdx = path_.top();
-            for (Flags dir : {Flags::North, Flags::South, Flags::East, Flags::West}) {
-                if (auto idx = indexOffset(curIdx, dir); idx.has_value() && not visited(*idx)) {
-                    direction[neighborCount] = dir;
-                    neighbors[neighborCount] = *idx;
-                    ++neighborCount;
+        do {
+            int neighbors[4];
+            Flags direction[4];
+            int neighborCount = 0;
+            assert(not path_.empty());
+            while (true) {
+                int curIdx = path_.back();
+                for (Flags dir : {Flags::North, Flags::South, Flags::East, Flags::West}) {
+                    if (auto idx = indexOffset(curIdx, dir); idx.has_value() && not visited(*idx)) {
+                        direction[neighborCount] = dir;
+                        neighbors[neighborCount] = *idx;
+                        ++neighborCount;
+                    }
                 }
-            }
-            if (neighborCount == 0) {
-                path_.pop();
-                if (path_.empty()) {
-                    state_ = State::Solving;
-                    solveEnter(0);
+                if (neighborCount == 0) {
+                    path_.pop_back();
+                    if (path_.empty()) {
+                        state_ = State::Solving;
+                        solveEnter(0);
+                        break;
+                    }
+                } else {
+                    std::uniform_int_distribution<int> dist =
+                        std::uniform_int_distribution<int>(0, neighborCount - 1);
+                    int nextPathIdx = dist(rg_);
+                    addEdge(curIdx, direction[nextPathIdx]);
+                    buildEnter(neighbors[nextPathIdx]);
                     break;
                 }
-            } else {
-                std::uniform_int_distribution<int> dist =
-                    std::uniform_int_distribution<int>(0, neighborCount - 1);
-                int nextPathIdx = dist(rg_);
-                addEdge(curIdx, direction[nextPathIdx]);
-                buildEnter(neighbors[nextPathIdx]);
-                break;
             }
-        }
+        } while (fastbuild_ && state_ == State::Building);
     }
 
     void removeFromPath(int idx) {
         maze_[idx] = Flags{+maze_[idx] & ~(+Flags::SolvePath)};
-        path.pop();
+        path_.pop_back();
     }
 
-    bool visited(int idx) const {
-        assert(idx >= 0);
-        assert(idx < maze_.size());
-        return (maze_[idx] & Flags::BuildVisited) != Flags::Empty;
-    }
-
-    bool solveVisited(int idx) const {
-        assert(idx >= 0);
-        assert(idx < maze_.size());
-        return (maze_[idx] & Flags::SolveVisited) != Flags::Empty;
-    }
+    bool visited(int idx) const { return isFlagSet(maze_[idx], Flags::BuildVisited); }
+    bool solveVisited(int idx) const { return isFlagSet(maze_[idx], Flags::SolveVisited); }
+    bool inCurrentSolvePath(int idx) const { return isFlagSet(maze_[idx], Flags::SolvePath); }
 
     std::pair<int, int> idx2xy(int idx) const { return {idx % width_, idx / width_}; }
+
     int toIdx(int x, int y) const { return width_ * y + x; }
 
     int indexOffsetUnchecked(int idx, Flags direction) const {
@@ -214,13 +270,13 @@ class Maze : public olc::PixelGameEngine {
 
     void buildEnter(int idx) {
         maze_[idx] |= Flags::BuildVisited;
-        path_.push(idx);
+        path_.push_back(idx);
     }
 
     void solveEnter(int idx) {
         maze_[idx] |= Flags::SolveVisited;
         maze_[idx] |= Flags::SolvePath;
-        path_.push(idx);
+        path_.push_back(idx);
     }
 
     void addEdge(int idx, Flags direction) {
@@ -229,16 +285,20 @@ class Maze : public olc::PixelGameEngine {
     }
 
   private:
-    int width_  = 40;
-    int height_ = 20;
+    int filterColorPct_ = 0;
+    bool fastbuild_         = 1;
+    bool fastsolve_         = 0;
+    int width_              = 40;
+    int height_             = 20;
+    float elapsed_          = 0;
     std::vector<Flags> maze_;
-    std::stack<int> path_;
+    std::vector<int> path_;
     State state_ = State::Building;
 };
 
 int main() {
     Maze app;
-    bool FULLSCREEN = 1;
+    bool FULLSCREEN = false;
     int PX_SIZE     = 1;
     if (app.Construct(1920, 1080, PX_SIZE, PX_SIZE, FULLSCREEN)) {
         app.Start();
